@@ -1,0 +1,28 @@
+name: isl_transformer
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=1.24
+  - pandas>=2.0
+  - tqdm>=4.65
+  - matplotlib>=3.7
+  - scipy>=1.11
+  # PyTorch with CUDA 12.1 (RTX 4050 compatible)
+  - pytorch>=2.2
+  - torchvision>=0.17
+  - torchaudio>=2.2
+  - pytorch-cuda=12.1
+  # OpenCV for real-time webcam demo
+  - opencv>=4.8
+  - pip:
+      # Pose file reader (iSign .pose format)
+      - pose-format>=0.3.4
+      # MediaPipe for real-time keypoint extraction
+      - mediapipe>=0.10
+      # NLP evaluation metrics
+      - sacrebleu>=2.3
+      - rouge-score>=0.1.2

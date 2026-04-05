@@ -1,0 +1,88 @@
+# -----------------------------
+# Python cache / bytecode
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# -----------------------------
+# Virtual environments / local Python installs
+# -----------------------------
+.conda/
+.venv/
+venv/
+env/
+
+# -----------------------------
+# Editor / OS artifacts
+# -----------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Jupyter artifacts
+# -----------------------------
+.ipynb_checkpoints/
+
+# -----------------------------
+# Build / packaging / test artifacts
+# -----------------------------
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# -----------------------------
+# Generated training outputs
+# Keep the split manifest, ignore everything else under artifacts/
+# -----------------------------
+/artifacts/*
+!/artifacts/splits.json
+logs/
+outputs/
+wandb/
+mlruns/
+lightning_logs/
+runs/
+*.log
+*.pid
+
+# Training scratch / cache
+training/__pycache__/
+training/legacy/**/__pycache__/
+training/legacy/**/*.py[cod]
+training/legacy/outputs/
+training/legacy/checkpoints/
+
+# Legacy backup area
+/_backup_legacy/
+
+# -----------------------------
+# Large / raw dataset files
+# -----------------------------
+/iSign-poses_v1.1/
+/iSign_v1.1.csv
+*.pose
+
+# Dataset exports and model checkpoints
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+
+# -----------------------------
+# Optional local dotenv files
+# -----------------------------
+.env
+.env.*
+!.env.example
