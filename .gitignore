@@ -51,6 +51,7 @@ wandb/
 mlruns/
 lightning_logs/
 runs/
+/archive/
 *.log
 *.pid
 
@@ -86,3 +87,11 @@ training/legacy/checkpoints/
 .env
 .env.*
 !.env.example
+
+/run_stageA_v3.sh
+/run_stageB_v3.sh
+/run_stageC_v2.sh
+
+ISLTranslate_Dataset_for_Translating_Indian_Sign_L.pdf
+# Added by code-review-graph
+.code-review-graph/

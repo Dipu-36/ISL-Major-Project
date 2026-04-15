@@ -33,7 +33,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class TemporalVisualEncoder(nn.Module):
-    def __init__(self, src_dim: int, d_model: int = 256, nhead: int = 8, num_layers: int = 2):
+    def __init__(self, src_dim: int, d_model: int = 256, nhead: int = 8, num_layers: int = 2, dropout: float = 0.0):
         super().__init__()
         self.input_proj = nn.Linear(src_dim, d_model)
         self.pos_enc = SinusoidalPositionalEncoding(d_model)
@@ -41,7 +41,7 @@ class TemporalVisualEncoder(nn.Module):
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=d_model * 4,
-            dropout=0.0,
+            dropout=dropout,
             batch_first=True,
             norm_first=True,
         )

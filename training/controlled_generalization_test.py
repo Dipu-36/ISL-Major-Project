@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import matplotlib.pyplot as plt
+import sacrebleu
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
@@ -74,6 +75,7 @@ class ControlledT5Dataset(Dataset):
         tokenizer: Any,
         preprocessing_cfg: PreprocessingConfig,
         max_target_len: int,
+        cache: dict[str, Any] | None = None,
     ):
         self.samples: list[dict[str, Any]] = []
 
@@ -82,22 +84,35 @@ class ControlledT5Dataset(Dataset):
             if text is None:
                 continue
 
-            pose_path = os.path.join(pose_dir, uid + ".pose")
-            if not os.path.exists(pose_path):
-                continue
-
-            try:
-                processed = preprocess_single_sample(
-                    uid=uid,
-                    raw_text=text,
-                    pose_path=pose_path,
-                    cfg=preprocessing_cfg,
-                )
-            except Exception:
-                continue
+            if cache is not None:
+                # Fast path: look up pre-processed features from cache
+                entry = cache.get(uid)
+                if entry is None:
+                    continue
+                clean = entry["text"]
+                # Cache stores float16 to save space; cast back to float32 for computation
+                src_np = entry["features"].astype("float32")
+                mask_np = entry["attention_mask"].astype("int64")
+            else:
+                # Slow path: read and preprocess .pose file on-the-fly
+                pose_path = os.path.join(pose_dir, uid + ".pose")
+                if not os.path.exists(pose_path):
+                    continue
+                try:
+                    processed = preprocess_single_sample(
+                        uid=uid,
+                        raw_text=text,
+                        pose_path=pose_path,
+                        cfg=preprocessing_cfg,
+                    )
+                except Exception:
+                    continue
+                clean = processed.text
+                src_np = processed.features
+                mask_np = processed.attention_mask
 
             tokenized = tokenizer(
-                processed.text,
+                clean,
                 truncation=True,
                 max_length=max_target_len,
                 return_tensors=None,
@@ -108,10 +123,10 @@ class ControlledT5Dataset(Dataset):
 
             self.samples.append(
                 {
-                    "uid": processed.uid,
-                    "text": processed.text,
-                    "src": torch.tensor(processed.features, dtype=torch.float32),
-                    "attention_mask": torch.tensor(processed.attention_mask, dtype=torch.long),
+                    "uid": uid,
+                    "text": clean,
+                    "src": torch.tensor(src_np, dtype=torch.float32),
+                    "attention_mask": torch.tensor(mask_np, dtype=torch.long),
                     "labels": torch.tensor(label_ids, dtype=torch.long),
                 }
             )
@@ -236,14 +251,17 @@ def compute_metrics(predictions: list[str], references: list[str]) -> dict[str, 
     if not predictions:
         return {"bleu": 0.0, "rouge_l": 0.0, "chrf": 0.0}
 
-    bleu_scores = [sentence_bleu_approx(h, r) for h, r in zip(predictions, references)]
+    # Corpus-level SacreBLEU — directly comparable to published papers
+    bleu = sacrebleu.corpus_bleu(predictions, [references]).score
+    chrf = sacrebleu.corpus_chrf(predictions, [references]).score
+
+    # ROUGE-L: sentence-level F1 averaged (verified identical to google rouge-score)
     rouge_scores = [100.0 * rouge_l_f1(h, r) for h, r in zip(predictions, references)]
-    chrf_scores = [chr_fscore(h, r) for h, r in zip(predictions, references)]
 
     return {
-        "bleu": float(statistics.mean(bleu_scores)),
+        "bleu": float(bleu),
         "rouge_l": float(statistics.mean(rouge_scores)),
-        "chrf": float(statistics.mean(chrf_scores)),
+        "chrf": float(chrf),
     }
 
 
@@ -400,8 +418,10 @@ def run_epoch(
     contrastive_loss_fn: ContrastivePairLoss | None = None,
     effective_lambda: float = 0.0,
     contrastive_weight: float = 0.0,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
+    use_amp = scaler is not None and device.type == "cuda"
     use_semantic = is_train and semantic_loss_fn is not None and effective_lambda > 0.0
     use_contrastive = is_train and contrastive_loss_fn is not None and contrastive_weight > 0.0
     # Share one encode_visual call across CE + semantic + contrastive when possible
@@ -416,10 +436,10 @@ def run_epoch(
     grad_norms: list[float] = []
 
     for batch in loader:
-        src = batch["src"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels_for_loss = batch["labels_for_loss"].to(device)
-        labels_clean = batch["labels"].to(device)
+        src = batch["src"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        labels_for_loss = batch["labels_for_loss"].to(device, non_blocking=True)
+        labels_clean = batch["labels"].to(device, non_blocking=True)
 
         if not torch.isfinite(src).all():
             raise RuntimeError("NaN/Inf detected in input features.")
@@ -427,71 +447,98 @@ def run_epoch(
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        if use_shared_encoder:
-            # Single visual-encoder forward pass; tensor is reused by T5 and aux losses.
-            encoder_hidden, reduced_mask = model.encode_visual(src, attention_mask)
-            outputs = model.t5(
-                encoder_outputs=BaseModelOutput(last_hidden_state=encoder_hidden),
-                attention_mask=reduced_mask,
-                labels=labels_for_loss,
-            )
-        else:
-            encoder_hidden = None
-            reduced_mask = None
-            # T5 performs token shifting internally when labels are provided.
-            outputs = model(src=src, attention_mask=attention_mask, labels=labels_for_loss)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            if use_shared_encoder:
+                # Single visual-encoder forward pass; tensor is reused by T5 and aux losses.
+                encoder_hidden, reduced_mask = model.encode_visual(src, attention_mask)
+                outputs = model.t5(
+                    encoder_outputs=BaseModelOutput(last_hidden_state=encoder_hidden),
+                    attention_mask=reduced_mask,
+                    labels=labels_for_loss,
+                )
+            else:
+                encoder_hidden = None
+                reduced_mask = None
+                # T5 performs token shifting internally when labels are provided.
+                outputs = model(src=src, attention_mask=attention_mask, labels=labels_for_loss)
 
-        logits = outputs.logits
+            logits = outputs.logits
 
-        if logits.shape[:2] != labels_for_loss.shape:
-            raise RuntimeError(
-                f"Logit/label sequence misalignment: logits={tuple(logits.shape)}, labels={tuple(labels_for_loss.shape)}"
-            )
+            if logits.shape[:2] != labels_for_loss.shape:
+                raise RuntimeError(
+                    f"Logit/label sequence misalignment: logits={tuple(logits.shape)}, labels={tuple(labels_for_loss.shape)}"
+                )
 
-        ce_loss = criterion(logits.reshape(-1, logits.shape[-1]), labels_for_loss.reshape(-1))
+            ce_loss = criterion(logits.reshape(-1, logits.shape[-1]), labels_for_loss.reshape(-1))
 
-        if not torch.isfinite(ce_loss):
-            raise RuntimeError("NaN/Inf detected in CE loss.")
+            if not torch.isfinite(ce_loss):
+                raise RuntimeError("NaN/Inf detected in CE loss.")
 
-        loss = ce_loss
+            loss = ce_loss
 
-        if use_semantic:
-            sem_loss = semantic_loss_fn(
-                logits=logits,
-                labels_for_loss=labels_for_loss,
-                labels_clean=labels_clean,
-            )
-            if not torch.isfinite(sem_loss):
-                raise RuntimeError("NaN/Inf detected in semantic loss.")
-            loss = loss + effective_lambda * sem_loss
-            total_sem_loss += float(sem_loss.item())
+            if use_semantic:
+                sem_loss = semantic_loss_fn(
+                    logits=logits,
+                    labels_for_loss=labels_for_loss,
+                    labels_clean=labels_clean,
+                )
+                if not torch.isfinite(sem_loss):
+                    raise RuntimeError("NaN/Inf detected in semantic loss.")
+                loss = loss + effective_lambda * sem_loss
+                total_sem_loss += float(sem_loss.item())
 
-        if use_contrastive:
-            text_mask = labels_for_loss.ne(-100)
-            con_loss = contrastive_loss_fn(
-                visual_hidden=encoder_hidden,
-                visual_mask=reduced_mask,
-                labels_clean=labels_clean,
-                text_mask=text_mask,
-            )
-            if not torch.isfinite(con_loss):
-                raise RuntimeError("NaN/Inf detected in contrastive loss.")
-            loss = loss + contrastive_weight * con_loss
-            total_con_loss += float(con_loss.item())
+            if use_contrastive:
+                text_mask = labels_for_loss.ne(-100)
+                con_loss = contrastive_loss_fn(
+                    visual_hidden=encoder_hidden,
+                    visual_mask=reduced_mask,
+                    labels_clean=labels_clean,
+                    text_mask=text_mask,
+                )
+                if not torch.isfinite(con_loss):
+                    raise RuntimeError("NaN/Inf detected in contrastive loss.")
+                loss = loss + contrastive_weight * con_loss
+                total_con_loss += float(con_loss.item())
 
         total_ce_loss += float(ce_loss.item())
 
         if is_train:
-            loss.backward()
-            grad_norm = compute_grad_norm(model)
-            if not math.isfinite(grad_norm):
-                raise RuntimeError("Non-finite gradient norm detected.")
-            grad_norms.append(float(grad_norm))
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
-            optimizer.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = compute_grad_norm(model)
+                if not math.isfinite(grad_norm):
+                    # AMP overflow: scaler will skip this step — expected behaviour
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    total_loss += float(loss.item())
+                    total_batches += 1
+                    continue
+                grad_norms.append(float(grad_norm))
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                grad_norm = compute_grad_norm(model)
+                if not math.isfinite(grad_norm):
+                    raise RuntimeError("Non-finite gradient norm detected.")
+                grad_norms.append(float(grad_norm))
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+                optimizer.step()
 
         total_loss += float(loss.item())
         total_batches += 1
+
+        if total_batches % 100 == 0:
+            phase = "train" if is_train else "val"
+            print(
+                f"  [{phase} batch {total_batches}/{len(loader)}]"
+                f" loss={total_loss/total_batches:.4f}"
+                + (f" ce={total_ce_loss/total_batches:.4f}" if is_train else ""),
+                flush=True,
+            )
 
     n = max(total_batches, 1)
     avg_grad = float(statistics.mean(grad_norms)) if grad_norms else 0.0
@@ -524,22 +571,30 @@ def decode_predictions(
         if max_batches is not None and batch_idx >= max_batches:
             break
 
-        src = batch["src"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        src = batch["src"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-        generated = model.generate(
-            src=src,
-            attention_mask=attention_mask,
-            max_length=48,
-            num_beams=decode_cfg.num_beams,
-            length_penalty=decode_cfg.length_penalty,
-            no_repeat_ngram_size=decode_cfg.no_repeat_ngram_size,
-            repetition_penalty=decode_cfg.repetition_penalty,
-        )
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            generated = model.generate(
+                src=src,
+                attention_mask=attention_mask,
+                max_length=48,
+                num_beams=decode_cfg.num_beams,
+                length_penalty=decode_cfg.length_penalty,
+                no_repeat_ngram_size=decode_cfg.no_repeat_ngram_size,
+                repetition_penalty=decode_cfg.repetition_penalty,
+            )
         pred_text = tokenizer.batch_decode(generated, skip_special_tokens=True)
 
         predictions.extend([p.strip() for p in pred_text])
         references.extend([t.strip() for t in batch["text"]])
+
+        if (batch_idx + 1) % 50 == 0:
+            total = len(loader) if max_batches is None else min(max_batches, len(loader))
+            print(
+                f"  [decode batch {batch_idx + 1}/{total}] {len(predictions)} decoded so far",
+                flush=True,
+            )
 
     return predictions, references
 
@@ -596,6 +651,9 @@ def build_dataloaders(
     batch_size: int,
     max_target_len: int,
     seed: int,
+    target_frames: int = 128,
+    num_workers: int = 4,
+    cache_dir: str | None = None,
 ) -> tuple[DataLoader, DataLoader, Any, int, int]:
     splits = load_json(os.path.join(root, "artifacts", "splits.json"))
     uid_to_text = load_uid_to_text(os.path.join(root, "iSign_v1.1.csv"))
@@ -605,7 +663,33 @@ def build_dataloaders(
     val_uids = list(splits["val_uids"])[:val_samples]
 
     tokenizer = AutoTokenizer.from_pretrained("t5-small")
-    prep_cfg = PreprocessingConfig(target_frames=96)
+    prep_cfg = PreprocessingConfig(target_frames=target_frames)
+
+    # ── Optional cache ────────────────────────────────────────────────────────
+    cache: dict[str, Any] | None = None
+    if cache_dir is not None:
+        cache_path = os.path.join(cache_dir, f"isl_tf{target_frames}.pt")
+        if os.path.exists(cache_path):
+            import torch as _torch
+            payload = _torch.load(cache_path, map_location="cpu", weights_only=False)
+            cache = payload["samples"]
+            meta = payload.get("meta", {})
+            print(
+                f"[cache] Loaded {meta.get('n_samples', len(cache))} entries "
+                f"from {cache_path}  (tf={meta.get('target_frames')})"
+            )
+        else:
+            print(
+                f"[cache] Cache not found at {cache_path} — "
+                f"falling back to live preprocessing.  "
+                f"Run build_cache.py to generate it."
+            )
+
+    train_uids = list(splits["train_uids"])[:train_samples]
+    val_uids = list(splits["val_uids"])[:val_samples]
+
+    tokenizer = AutoTokenizer.from_pretrained("t5-small")
+    prep_cfg = PreprocessingConfig(target_frames=target_frames)
 
     train_ds = ControlledT5Dataset(
         uids=train_uids,
@@ -614,6 +698,7 @@ def build_dataloaders(
         tokenizer=tokenizer,
         preprocessing_cfg=prep_cfg,
         max_target_len=max_target_len,
+        cache=cache,
     )
     val_ds = ControlledT5Dataset(
         uids=val_uids,
@@ -622,16 +707,22 @@ def build_dataloaders(
         tokenizer=tokenizer,
         preprocessing_cfg=prep_cfg,
         max_target_len=max_target_len,
+        cache=cache,
     )
 
     generator = torch.Generator()
     generator.manual_seed(seed)
 
+    # num_workers > 0 triggers persistent_workers for faster epoch transitions
+    persistent = num_workers > 0
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=num_workers,
+        persistent_workers=persistent,
+        pin_memory=True,
         generator=generator,
         collate_fn=lambda b: collate_t5(b, pad_id=tokenizer.pad_token_id),
     )
@@ -639,7 +730,9 @@ def build_dataloaders(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
+        persistent_workers=persistent,
+        pin_memory=True,
         collate_fn=lambda b: collate_t5(b, pad_id=tokenizer.pad_token_id),
     )
 
@@ -717,6 +810,11 @@ def run_single_experiment(
     checkpoint_path: str | None = None,
     unfreeze_decoder_layers: int = 0,
     decoder_lr: float = 2e-5,
+    encoder_layers: int = 2,
+    encoder_dropout: float = 0.0,
+    target_frames: int = 128,
+    cache_dir: str | None = None,
+    decode_every_n: int = 1,
 ) -> dict[str, Any]:
     set_global_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -731,9 +829,16 @@ def run_single_experiment(
         batch_size=batch_size,
         max_target_len=max_target_len,
         seed=seed,
+        target_frames=target_frames,
+        cache_dir=cache_dir,
     )
 
-    model = T5BridgeModel(src_dim=450, freeze_t5=True).to(device)
+    model = T5BridgeModel(
+        src_dim=450,
+        freeze_t5=True,
+        encoder_layers=encoder_layers,
+        encoder_dropout=encoder_dropout,
+    ).to(device)
 
     # ── Selective decoder unfreezing ──────────────────────────────
     if unfreeze_decoder_layers > 0:
@@ -809,11 +914,19 @@ def run_single_experiment(
 
     probe_batch = next(iter(val_loader))
 
+    # ── Mixed precision ───────────────────────────────────────────
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if use_amp:
+        print(f"[{run_name}] AMP enabled (float16 autocast + GradScaler)")
+
     history: list[EpochSummary] = []
     sample_predictions: list[dict[str, Any]] = []
     last_error_analysis: dict[str, Any] = {}
     if best_val_loss == float("inf"):
         best_val_loss = float("inf")
+
+    last_epoch = start_epoch + epochs - 1
 
     for epoch in range(start_epoch, start_epoch + epochs):
         # Apply warmup to semantic lambda (contrastive weight is fixed)
@@ -827,22 +940,44 @@ def run_single_experiment(
             contrastive_loss_fn=contrastive_loss_fn,
             effective_lambda=effective_lambda,
             contrastive_weight=contrastive_weight,
+            scaler=scaler,
         )
         val_stats = run_epoch(model, val_loader, device, optimizer=None, criterion=criterion)
 
-        predictions, references = decode_predictions(
-            model,
-            val_loader,
-            tokenizer,
-            device,
-            decode_cfg,
-            max_batches=metric_eval_batches if metric_eval_batches > 0 else None,
+        # ── Decide whether to run expensive decode this epoch ─────
+        is_last_epoch = epoch == last_epoch
+        is_decode_epoch = (
+            is_last_epoch
+            or decode_every_n <= 1
+            or (epoch - start_epoch) % decode_every_n == 0
         )
 
-        metrics = compute_metrics(predictions, references)
-        failure = detect_failure_patterns(predictions)
-        dep = input_dependence_test(model, probe_batch, tokenizer, device, decode_cfg)
-        avg_out_len, avg_ref_len, len_ratio = average_token_lengths(predictions, references)
+        if is_decode_epoch:
+            predictions, references = decode_predictions(
+                model,
+                val_loader,
+                tokenizer,
+                device,
+                decode_cfg,
+                max_batches=None,  # evaluate on full val set for reliable metrics
+            )
+
+            metrics = compute_metrics(predictions, references)
+            failure = detect_failure_patterns(predictions)
+            dep = input_dependence_test(model, probe_batch, tokenizer, device, decode_cfg)
+            avg_out_len, avg_ref_len, len_ratio = average_token_lengths(predictions, references)
+        else:
+            # Lightweight epoch: carry forward zeros for generation metrics
+            predictions, references = [], []
+            metrics = {"bleu": 0.0, "rouge_l": 0.0, "chrf": 0.0}
+            failure = {
+                "unique_prediction_ratio": 0.0,
+                "dominant_prediction_ratio": 0.0,
+                "repetitive_output_ratio": 0.0,
+                "generic_sentence_ratio": 0.0,
+            }
+            dep = {"difference_ratio": 0.0, "real_examples": [], "zero_examples": []}
+            avg_out_len, avg_ref_len, len_ratio = 0.0, 0.0, 0.0
 
         summary = EpochSummary(
             epoch=epoch,
@@ -887,7 +1022,7 @@ def run_single_experiment(
             best_val_loss = val_loss_val
             torch.save(ckpt_payload, os.path.join(run_dir, "best_model.pt"))
             print(f"  ↳ New best val_loss={best_val_loss:.4f} — saved best_model.pt")
-        if rouge_l_val > best_rouge_l:
+        if is_decode_epoch and rouge_l_val > best_rouge_l:
             best_rouge_l = rouge_l_val
             torch.save(ckpt_payload, os.path.join(run_dir, "best_rouge_l_model.pt"))
             print(f"  ↳ New best ROUGE-L={best_rouge_l:.2f} — saved best_rouge_l_model.pt")
@@ -895,37 +1030,10 @@ def run_single_experiment(
         scheduler.step()
 
         # Run error analysis on the final epoch only (avoids per-epoch overhead)
-        if epoch == start_epoch + epochs - 1:
+        if is_last_epoch and predictions:
             last_error_analysis = categorize_predictions(predictions, references)
 
-        n_log = min(10, len(predictions))
-        sample_predictions.append(
-            {
-                "epoch": epoch,
-                "examples": [
-                    {
-                        "reference": references[i] if i < len(references) else "",
-                        "prediction": predictions[i] if i < len(predictions) else "",
-                        "is_generic": is_generic_sentence(predictions[i]) if i < len(predictions) else True,
-                    }
-                    for i in range(n_log)
-                ],
-                "input_dependence_examples": {
-                    "real": dep["real_examples"],
-                    "zero": dep["zero_examples"],
-                },
-            }
-        )
-
-        # ── Log sample predictions to stdout ──────────────────────
-        print(f"  Predictions (epoch {epoch}, {n_log} samples):")
-        for i in range(n_log):
-            ref = references[i] if i < len(references) else ""
-            pred = predictions[i] if i < len(predictions) else ""
-            marker = " [G]" if is_generic_sentence(pred) else ""
-            print(f"    [{i}] ref:  {ref}")
-            print(f"         pred: {pred}{marker}")
-
+        # ── Logging ───────────────────────────────────────────────
         sem_info = (
             f" ce={train_stats['ce_loss']:.4f} sem={train_stats['semantic_loss']:.4f}"
             f" λ_eff={effective_lambda:.3f}"
@@ -933,14 +1041,51 @@ def run_single_experiment(
             if (semantic_lambda > 0.0 or contrastive_weight > 0.0)
             else ""
         )
-        print(
-            f"[{run_name}] epoch={epoch} train_loss={train_stats['loss']:.4f} val_loss={val_stats['loss']:.4f}"
-            f"{sem_info} "
-            f"BLEU={metrics['bleu']:.2f} ROUGE-L={metrics['rouge_l']:.2f} CHRF={metrics['chrf']:.2f} "
-            f"input_diff={dep['difference_ratio']:.2f} unique={failure['unique_prediction_ratio']:.2f} "
-            f"dominant={failure['dominant_prediction_ratio']:.2f} generic={failure['generic_sentence_ratio']:.2f} "
-            f"len_ratio={len_ratio:.2f} grad_avg={train_stats['avg_grad_norm']:.3f} grad_max={train_stats['max_grad_norm']:.3f}"
-        )
+
+        if is_decode_epoch:
+            n_log = min(10, len(predictions))
+            sample_predictions.append(
+                {
+                    "epoch": epoch,
+                    "examples": [
+                        {
+                            "reference": references[i] if i < len(references) else "",
+                            "prediction": predictions[i] if i < len(predictions) else "",
+                            "is_generic": is_generic_sentence(predictions[i]) if i < len(predictions) else True,
+                        }
+                        for i in range(n_log)
+                    ],
+                    "input_dependence_examples": {
+                        "real": dep["real_examples"],
+                        "zero": dep["zero_examples"],
+                    },
+                }
+            )
+
+            print(f"  Predictions (epoch {epoch}, {n_log} samples):")
+            for i in range(n_log):
+                ref = references[i] if i < len(references) else ""
+                pred = predictions[i] if i < len(predictions) else ""
+                marker = " [G]" if is_generic_sentence(pred) else ""
+                print(f"    [{i}] ref:  {ref}")
+                print(f"         pred: {pred}{marker}")
+
+            print(
+                f"[{run_name}] epoch={epoch} train_loss={train_stats['loss']:.4f} val_loss={val_stats['loss']:.4f}"
+                f"{sem_info} "
+                f"BLEU={metrics['bleu']:.2f} ROUGE-L={metrics['rouge_l']:.2f} CHRF={metrics['chrf']:.2f} "
+                f"input_diff={dep['difference_ratio']:.2f} unique={failure['unique_prediction_ratio']:.2f} "
+                f"dominant={failure['dominant_prediction_ratio']:.2f} generic={failure['generic_sentence_ratio']:.2f} "
+                f"len_ratio={len_ratio:.2f} grad_avg={train_stats['avg_grad_norm']:.3f} grad_max={train_stats['max_grad_norm']:.3f}"
+            )
+        else:
+            print(
+                f"[{run_name}] epoch={epoch} train_loss={train_stats['loss']:.4f} val_loss={val_stats['loss']:.4f}"
+                f"{sem_info} "
+                f"(decode skipped — next decode at epoch {epoch + decode_every_n - (epoch - start_epoch) % decode_every_n})"
+                f" grad_avg={train_stats['avg_grad_norm']:.3f} grad_max={train_stats['max_grad_norm']:.3f}",
+                flush=True,
+            )
 
     save_plots(history, run_dir, run_name)
 
@@ -1175,6 +1320,45 @@ def parse_args() -> argparse.Namespace:
         default=2e-5,
         help="Learning rate for unfrozen decoder parameters (default: 2e-5).",
     )
+    parser.add_argument(
+        "--encoder-layers",
+        type=int,
+        default=2,
+        help="Number of Transformer layers in the visual encoder (default: 2).",
+    )
+    parser.add_argument(
+        "--encoder-dropout",
+        type=float,
+        default=0.0,
+        help="Dropout rate in visual encoder layers (default: 0.0).",
+    )
+    parser.add_argument(
+        "--target-frames",
+        type=int,
+        default=128,
+        help="Number of frames to keep per sample after keyframe selection (default: 128).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing pre-built dataset cache files produced by build_cache.py. "
+            "If set and the cache for --target-frames exists, loading skips all .pose file I/O "
+            "and runs in seconds instead of ~90 minutes. "
+            "Example: artifacts/dataset_cache"
+        ),
+    )
+    parser.add_argument(
+        "--decode-every-n",
+        type=int,
+        default=1,
+        help=(
+            "Run full beam-search decode every N epochs (default: 1 = every epoch). "
+            "Set to 3 to skip decode on 2 out of 3 epochs for ~30-40%% speedup. "
+            "The last epoch always runs full decode regardless of this setting."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1217,6 +1401,11 @@ def main() -> None:
         "checkpoint_path": args.checkpoint_path,
         "unfreeze_decoder_layers": args.unfreeze_decoder_layers,
         "decoder_lr": args.decoder_lr,
+        "encoder_layers": args.encoder_layers,
+        "encoder_dropout": args.encoder_dropout,
+        "target_frames": args.target_frames,
+        "cache_dir": os.path.abspath(args.cache_dir) if args.cache_dir else None,
+        "decode_every_n": args.decode_every_n,
     }
 
     if args.lambda_sweep:

@@ -35,6 +35,21 @@ class PreprocessedSample:
     raw_length: int
 
 
+def compute_attention_mask(target_frames: int, valid_length: int) -> np.ndarray:
+    """Create attention mask where 1=valid frame, 0=padding.
+
+    Args:
+        target_frames: Total sequence length (including padding)
+        valid_length: Number of valid (non-padding) frames
+
+    Returns:
+        Binary attention mask of shape (target_frames,)
+    """
+    mask = np.zeros((target_frames,), dtype=np.int64)
+    mask[:min(valid_length, target_frames)] = 1
+    return mask
+
+
 def clean_text(text: str, max_chars: int = 256) -> str:
     lowered = text.lower().strip()
     normalized = re.sub(r"[^a-z0-9'.,?!\s-]", " ", lowered)
@@ -107,21 +122,29 @@ def smooth_exponential(x: np.ndarray, alpha: float = 0.5) -> np.ndarray:
     return smoothed
 
 
-def temporal_sample_keyframes(x: np.ndarray, target_frames: int) -> np.ndarray:
+def temporal_sample_keyframes(x: np.ndarray, target_frames: int) -> tuple[np.ndarray, int]:
     """Select *target_frames* frames by motion importance, preserving temporal order.
 
     Velocity magnitude (mean across all joints) scores each frame.  The top-K
     most dynamic frames are selected, with the first and last frame always
     included to preserve boundary context.  When the clip is too short the
     sequence is right-padded with its last frame.
+
+    Returns:
+        Tuple of (sampled_features, valid_length) where valid_length is the
+        number of non-padding frames (original frames before padding).
     """
     T = x.shape[0]
     if T == 0:
-        return np.zeros((target_frames, x.shape[1] if x.ndim > 1 else 75, x.shape[2] if x.ndim > 2 else 3), dtype=np.float32)
+        return (
+            np.zeros((target_frames, x.shape[1] if x.ndim > 1 else 75, x.shape[2] if x.ndim > 2 else 3), dtype=np.float32),
+            0
+        )
 
     if T <= target_frames:
         pad = target_frames - T
-        return np.concatenate([x, np.tile(x[-1:], (pad,) + (1,) * (x.ndim - 1))], axis=0).astype(np.float32)
+        padded = np.concatenate([x, np.tile(x[-1:], (pad,) + (1,) * (x.ndim - 1))], axis=0).astype(np.float32)
+        return padded, T  # valid_length = original length before padding
 
     # Frame-level velocity magnitude: mean L2 norm of per-joint displacements
     importance = np.zeros(T, dtype=np.float32)
@@ -136,7 +159,8 @@ def temporal_sample_keyframes(x: np.ndarray, target_frames: int) -> np.ndarray:
 
     top_idx = np.argpartition(importance, -target_frames)[-target_frames:]
     selected_idx = np.sort(top_idx)  # restore temporal order
-    return x[selected_idx].astype(np.float32)
+    # When downsampling, all target_frames are "valid" (real content)
+    return x[selected_idx].astype(np.float32), target_frames
 
 
 def add_velocity_features(x: np.ndarray) -> np.ndarray:
@@ -161,17 +185,18 @@ def preprocess_single_sample(
 
     normalized = normalize_spatial(pose)
     denoised = smooth_exponential(normalized, alpha=active_cfg.exp_smoothing_alpha)
-    sampled = temporal_sample_keyframes(denoised, active_cfg.target_frames)
+    sampled, valid_len = temporal_sample_keyframes(denoised, active_cfg.target_frames)
     features = add_velocity_features(sampled)
 
-    attention_mask = np.ones((active_cfg.target_frames,), dtype=np.int64)
+    # Generate proper attention mask: 1 for valid frames, 0 for padding
+    attention_mask = compute_attention_mask(active_cfg.target_frames, valid_len)
 
     return PreprocessedSample(
         uid=uid,
         text=text,
         features=features,
         attention_mask=attention_mask,
-        valid_length=active_cfg.target_frames,
+        valid_length=valid_len,
         raw_length=raw_len,
     )
 

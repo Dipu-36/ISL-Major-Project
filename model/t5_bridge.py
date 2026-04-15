@@ -16,9 +16,16 @@ class T5BridgeModel(nn.Module):
         t5_name: str = "t5-small",
         temporal_hidden: int = 256,
         freeze_t5: bool = True,
+        encoder_layers: int = 2,
+        encoder_dropout: float = 0.0,
     ):
         super().__init__()
-        self.temporal_encoder = TemporalVisualEncoder(src_dim=src_dim, d_model=temporal_hidden)
+        self.temporal_encoder = TemporalVisualEncoder(
+            src_dim=src_dim,
+            d_model=temporal_hidden,
+            num_layers=encoder_layers,
+            dropout=encoder_dropout,
+        )
         self.t5 = AutoModelForSeq2SeqLM.from_pretrained(t5_name)
 
         if freeze_t5:
