@@ -1,6 +1,6 @@
 # ISL Translation Project — Complete Architecture Documentation
 
-**Last Updated:** April 10, 2026
+**Last Updated:** April 16, 2026
 
 ---
 
@@ -568,6 +568,53 @@ File: [`config/arch_v2_redesign.py`](config/arch_v2_redesign.py)
 | **GATE_MAX_L1_ISOTROPY** | 0.50 | Maximum allowed collapse |
 | **WPP_AUX_WEIGHT_INIT** | 0.5 | Starting auxiliary weight |
 | **WPP_AUX_WEIGHT_END** | 0.05 | Final auxiliary weight |
+
+### Architecture Snapshot (exported constants)
+
+```text
+# arch_v2_redesign.py snapshot (exported constants) — exported 2026-04-16
+SRC_DIM = 450
+TARGET_FRAMES = 96
+ENCODER_LAYERS = 4
+D_MODEL = 256
+NHEAD = 8
+DIM_FEEDFORWARD = 1024
+ENCODER_DROPOUT = 0.15
+
+# WPP / Stage A
+WPP_VOCAB_SIZE = 150
+WPP_MIN_WORD_FREQ = 50
+WPP_VOCAB_CACHE = artifacts/wpp_vocab.json
+WPP_LR = 3e-4
+WPP_LR_MIN = 1e-6
+WPP_WARMUP_EPOCHS = 3
+WPP_MAX_EPOCHS = 60
+WPP_EARLY_STOP_PATIENCE = 15
+WPP_BATCH_SIZE = 128
+WPP_WEIGHT_DECAY = 1e-2
+
+# Soft VICReg
+VICREG_COEFF_VAR = 0.25
+VICREG_COEFF_COV = 0.02
+VICREG_GAMMA = 1.0
+
+# Stage B gate
+GATE_MIN_AUC = 0.62
+GATE_MIN_WORDS_ABOVE_AUC = 25
+GATE_MAX_L1_ISOTROPY = 0.50
+
+# Stage C
+LR_ENCODER = 1e-4
+LR_DECODER = 1e-5
+DECODER_LAYERS_UNFREEZE = 2
+WPP_AUX_WEIGHT_INIT = 0.5
+WPP_AUX_WEIGHT_END = 0.05
+WPP_AUX_EPOCHS = 30
+
+# Augmentation
+FRAME_DROPOUT_RATE = 0.15
+JOINT_NOISE_STD = 0.01
+```
 
 ---
 
